@@ -1,0 +1,177 @@
+<%
+
+import MongoKitten
+
+
+// we are using mlab a database as service for MongoDB
+// to connect to this database via code we'll use MongoKitten library
+
+func connectToDatabase(completion:@escaping  (Database?, Error?) -> Void) {
+    let dbUser = "admin", dbPassword = "123456789"
+    let dbStringUrl = "mongodb://\(dbUser):\(dbPassword)@ds121686.mlab.com:21686/tutorial_database"
+
+    do {
+      let db =  try MongoKitten.Database(dbStringUrl)
+      completion(db, nil)
+    } catch {
+      completion(nil, error)
+    }
+}
+
+
+
+extension ObjectId {
+
+    func toString() -> String {
+       var value:String!
+       if case let .literal(bsonPrimitive) = self.makeExpression() {
+          value = String(describing: bsonPrimitive)
+       }
+      return value
+   }
+}
+
+extension String {
+       ///transform json string to document
+    func toDocument() throws -> Document? {
+       var doc:Document? = nil
+        do {
+            doc = try Document(extendedJSON: self)
+        } catch(let err) {  throw err }
+        return doc
+    }
+}
+
+
+
+struct DeviceTokenItem {
+    let id:ObjectId
+    let token:String
+    let uid:String
+
+    init?(document doc: Document) {
+        guard let token = doc["token"]   as? String,
+			  let uid = doc["uid"] as? String,
+			  let id = doc["_id"] as? ObjectId
+        else {  return nil  }
+
+      self.token = (token).lowercased()
+      self.uid = (uid).lowercased()
+      self.id = id
+    }
+
+
+  public var dictionary:[String:Any] {
+      return [
+               "token":       self.token,
+               "uid":      self.uid,
+               "_id":         self.id.toString()
+             ]
+     }
+
+  // use to lowercased value for each keys
+   public init?(_ doc:Document) {
+
+		guard let token = doc["token"]   as? String,
+			  let uid = doc["uid"] as? String
+        else {  return nil  }
+
+      self.token = (token).lowercased()
+      self.uid = (uid).lowercased()
+      self.id = ObjectId()
+
+  }
+
+   public func toDocument() -> Document {
+      var doc = Document()
+      doc["token"] =  self.token
+      doc["uid"] = self.uid
+      return doc
+  }
+}
+
+
+
+
+
+
+let collection_Name = "DeviceTokens"
+
+
+/*
+   This route should send remote notifications
+   to any desired user by providing a uid
+*/
+
+
+Request.addHandler(forMethod: "GET", withRoute: "/:uid") {
+   connectToDatabase { db, err in
+      if err != nil { Response("\((err?.localizedDescription)!)") }
+      else {
+         let param  = Request.routeParams[2]
+         guard let collection = db?[collection_Name]
+         else { Response("Error 404 Bad Request"); return  }
+
+      do {
+
+        guard !param.isEmpty
+        else { Response("Error 404 Bad Request"); return  }
+
+           let query: Query = "uid" == param.lowercased()
+           let queryItems  =   try collection.find(query)
+
+           guard let selectedDevice = try  queryItems
+                                 .flatMap({ DeviceTokenItem(document: $0)})
+                                 .first
+            else { Response("Error 404 Bad Request"); return  }
+            
+        // here we'll handle APNS  ...
+
+        let s = SEApns2()
+        let certificatePath = "./dev_apns_cert.p12" //<--- change this to yours 
+        s.setP12Cert(filePath: certificatePath)
+        s.setNotificationPayload(SEApns2.Payload(alert: "testing from SwiftEngine"), toDeviceToken: selectedDevice.token)
+
+        s.send { result in 
+          switch result { 
+            case .success(let value):  Response("\(value)")
+            case .failure(let err):  Response("\(err)")
+          }
+        } 
+     }
+      catch(let err) { Response("\(err)")  } 
+    }
+  }
+}
+
+
+
+
+/*
+  This route will handle any incoming payload
+  and save it to mlab database
+*/
+Request.addHandler(forMethod: "POST") {
+
+   connectToDatabase { db, err in
+       if err != nil { Response("\((err?.localizedDescription)!)") }
+       else {
+            if let rawPostDataString = Request.server["RAW_POST_DATA"] as? String,
+               let collection = db?[collection_Name]
+            {
+             do {
+                 if let document = try rawPostDataString.toDocument(),
+                    let deviceTokenItem = DeviceTokenItem(document)
+                  {
+                     _ = try collection.insert(deviceTokenItem.toDocument())
+                  Response.write("Successfully posted to your collection")
+              } else {
+                Response("Could not post your device token, try again later")
+              }
+             } catch (let err) { Response("\(err)") }
+        }
+       }
+   }
+
+}
+%>
